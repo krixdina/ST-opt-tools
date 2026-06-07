@@ -297,10 +297,15 @@ private:
             else
                 cost3 = std::numeric_limits<double>::infinity();
 
-            // Decide whether to skip current point
+            // 决定是否保留当前中间点 path[i]
+            // 若 prev_pose -> pose2 直连更短，则说明 pose1 是冗余点。
+            // 此时这里不将 path[i] 放入 optimized_path，
+            // 等价于“隐式跳过/删除当前点”。
             if (cost3 < cost1 + cost2) {
+                // 更新合并后路径段的代价，供下一轮继续与后续点比较
                 cost1 = cost3;
             } else {
+                // 直连不划算或不可行，保留当前点作为新的关键点
                 optimized_path.push_back(path[i]);
                 cost1 = (pose1 - pose2).norm();
                 prev_pose = pose1;
@@ -370,7 +375,11 @@ private:
         while (ref_angle - angle > M_PI) angle += 2 * M_PI;
         while (ref_angle - angle < -M_PI) angle -= 2 * M_PI;
     }
-
+    
+    // 对整条路径中的每一段路径应用梯形/三角加减速模型得到整条路径的执行总时长 total_time 
+    // 根据 total_time 计算出时间采样点之间的间隔 sample_time
+    // 在整条路径中按照 sample_time 使用梯形加减速模型进行插值获取每一个 sample_time 在轨迹上的对应状态
+    // 将插值点组成的轨迹送入后端进行优化
     void assignTrajectoryTiming(Trajectory& traj) {
         if (traj.path_states.empty()) return;
 
@@ -386,7 +395,16 @@ private:
         // Calculate total time (trapezoidal velocity profile)
         traj.total_time = evaluateDuration(traj.weighted_length, 0, 0, max_vel_, max_acc_);
         
-        // Sample time points
+        // 计算相邻两个时间采样点之间的间隔 sample_time。
+        // 这里不是直接令 sample_time = time_resolution_，
+        // 而是先用 total_time / time_resolution_ 估算“整条轨迹大约应采多少个点”。
+        //
+        // 其中 time_resolution_ 表示期望的时间采样分辨率，单位是秒：
+        // 例如 time_resolution_ = 0.2，表示希望大致每 0.2s 采一个轨迹点。
+        //
+        // 但如果 total_time 很短，按这个分辨率算出来的采样点数可能太少，
+        // 所以这里还用 min_traj_num_ 约束最少采样点数。
+        // 最终 sample_time = 总时长 / 实际采样段数。
         double sample_time = traj.total_time / 
                            std::max(static_cast<int>(traj.total_time / time_resolution_ + 0.5), 
                                    min_traj_num_);
@@ -396,25 +414,32 @@ private:
         size_t state_idx = 0;
         
         for (double t = sample_time; t < traj.total_time - 1e-3; t += sample_time) {
+            // 根据当前时刻 t 反推出此时沿路径累计前进了多远
             double s = evaluateLength(t, traj.weighted_length, traj.total_time, 
                                     0, 0, max_vel_, max_acc_);
             
-            // Find corresponding state
+            // 在离散路径段中查找累计路程 s 落在哪一段
+            // 在将当前段纳入累计长度后，必须大于按照当前时间 t 查询出的累计前进距离 s
             while (state_idx < traj.path_states.size() - 1 && 
                    accumulated_s + traj.path_states[state_idx].delta_s < s) {
+                // 若当前段还不足以覆盖 s，则继续向后推进到下一段
                 accumulated_s += traj.path_states[state_idx].delta_s;
                 state_idx++;
             }
             
             if (state_idx > 0) {
+                // 计算 s 在当前路径段内部的相对位置比例，用于线性插值
                 double ratio = (s - accumulated_s) / traj.path_states[state_idx].delta_s;
                 
+                // 在相邻两个路径状态之间插值得到当前位置
                 Eigen::Vector2d pos = traj.path_states[state_idx-1].position + 
                                      ratio * (traj.path_states[state_idx].position - 
                                              traj.path_states[state_idx-1].position);
+                // 对航向角也做同样的插值，得到当前时刻的姿态
                 double theta = traj.path_states[state_idx-1].theta + 
                              ratio * (traj.path_states[state_idx].delta_theta);
                 
+                // 将带时间戳的轨迹点 (x, y, theta, t) 保存下来
                 traj.timed_trajectory.push_back({
                     Eigen::Vector3d(pos.x(), pos.y(), theta),
                     t
@@ -431,6 +456,7 @@ private:
         traj.final_state_XYTheta << goal.x(), goal.y(), traj.path_states.back().theta;
         
         // Generate unoccupied positions sequence
+        // 将位置序列从轨迹序列中提取出来
         for (const auto& state : traj.path_states) {
             traj.UnOccupied_positions.emplace_back(
                 state.position.x(), 
@@ -439,7 +465,8 @@ private:
             );
         }
         
-        // Set initial time
+        // 以“总时长 / 采样点数”的方式估计相邻轨迹点之间的平均时间间隔，
+        // 这里的 UnOccupied_initT 更准确地说是表示了初始时间步长。
         traj.UnOccupied_initT = traj.total_time / traj.timed_trajectory.size();
         
         // Check if needs truncation
@@ -452,44 +479,76 @@ private:
 
     double evaluateDuration(double length, double start_vel, double end_vel, 
                            double max_vel, double max_acc) const {
+        // 先计算达到 max_vel 所需的最小路径长度：
+        // 前半段用于从 start_vel 加速到 max_vel，
+        // 后半段用于从 max_vel 减速到 end_vel。
         double critical_len = (max_vel*max_vel - start_vel*start_vel)/(2*max_acc) + 
                             (max_vel*max_vel - end_vel*end_vel)/(2*max_acc);
         
         if (length >= critical_len) {
+            // 路径足够长：采用梯形速度曲线
+            // 总时间 = 加速时间 + 匀速时间 + 减速时间
             return (max_vel - start_vel)/max_acc + 
                   (max_vel - end_vel)/max_acc + 
                   (length - critical_len)/max_vel;
         } else {
+            // 路径不够长：达不到 max_vel，采用三角速度曲线
+            // 先求能达到的峰值速度 tmp_vel，再计算加减速总时间
             double tmp_vel = sqrt(0.5*(start_vel*start_vel + end_vel*end_vel + 2*max_acc*length));
             return (tmp_vel - start_vel)/max_acc + (tmp_vel - end_vel)/max_acc;
         }
     }
 
+    // 给定时刻 t，按照梯形/三角速度曲线估计从起点累计走过的路径长度。
+    //
+    // 这个函数与 evaluateDuration() 是配套使用的：
+    // 1. evaluateDuration() 先根据总路径长度估计整条轨迹总时长；
+    // 2. evaluateLength() 再根据某个时刻 t，反推出该时刻已经走过的累计路程 s。
+    //
+    // total_length 表示整条路径的总长度（这里实际上传入的是 weighted_length），
+    // t 表示当前采样时刻，返回值则表示该时刻对应的累计路径长度。
     double evaluateLength(double t, double total_length, double total_time, 
                          double start_vel, double end_vel, 
                          double max_vel, double max_acc) const {
+        // 与 evaluateDuration() 中相同，critical_len 表示：
+        // 从 start_vel 加速到 max_vel，再从 max_vel 减速到 end_vel
+        // 至少需要多少路径长度。
         double critical_len = (max_vel*max_vel - start_vel*start_vel)/(2*max_acc) + 
                             (max_vel*max_vel - end_vel*end_vel)/(2*max_acc);
         
         if (total_length >= critical_len) {
+            // 路径足够长：采用梯形速度曲线
+            // t1: 加速段结束时刻
+            // t2: 匀速段结束、减速段开始时刻
             double t1 = (max_vel - start_vel)/max_acc;
             double t2 = t1 + (total_length - critical_len)/max_vel;
             
             if (t <= t1) {
+                // 加速阶段：s = v0 * t + 1/2 * a * t^2
                 return start_vel*t + 0.5*max_acc*t*t;
             } else if (t <= t2) {
+                // 匀速阶段：
+                // 累计长度 = 加速段长度 + 匀速段长度
                 return start_vel*t1 + 0.5*max_acc*t1*t1 + (t - t1)*max_vel;
             } else {
+                // 减速阶段：
+                // 累计长度 = 加速段长度 + 匀速段长度 + 当前减速段内走过的长度
                 return start_vel*t1 + 0.5*max_acc*t1*t1 + (t2 - t1)*max_vel + 
                       max_vel*(t - t2) - 0.5*max_acc*(t - t2)*(t - t2);
             }
         } else {
+            // 路径不够长：达不到 max_vel，采用三角速度曲线
+            // tmp_vel: 在该路径长度约束下能够达到的峰值速度
+            // tmp_t: 加速到峰值速度所需时间
             double tmp_vel = sqrt(0.5*(start_vel*start_vel + end_vel*end_vel + 2*max_acc*total_length));
             double tmp_t = (tmp_vel - start_vel)/max_acc;
             
             if (t <= tmp_t) {
+                // 加速阶段：公式与梯形速度曲线的加速段相同
                 return start_vel*t + 0.5*max_acc*t*t;
             } else {
+                // 减速阶段：
+                // 累计长度 = 前半段加速长度 + 后半段减速过程中已走过的长度
                 return start_vel*tmp_t + 0.5*max_acc*tmp_t*tmp_t + 
                       tmp_vel*(t - tmp_t) - 0.5*max_acc*(t - tmp_t)*(t - tmp_t);
             }

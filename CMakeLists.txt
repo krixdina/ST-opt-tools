@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(SplineTrajectoryExamples)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -36,4 +38,3 @@ target_link_libraries(test_astar Eigen3::Eigen  ${OpenCV_LIBS})
 
 add_executable(test_opt src/test_opt.cpp)
 target_link_libraries(test_opt Eigen3::Eigen  ${OpenCV_LIBS})
-

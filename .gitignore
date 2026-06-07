@@ -1,0 +1,34 @@
+# CMake build directories
+/build/
+/cmake-build-*/
+/out/
+
+# CMake-generated files
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/CTestTestfile.cmake
+/Testing/
+/CMakeFiles/
+
+# Native build outputs
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.d
+
+# Coverage and profiling artifacts
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
